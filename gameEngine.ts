@@ -1,4 +1,4 @@
-import { Card, Suit, Rank, Player, TrickPlayedCard, TrickResult, RoundResult } from './types';
+import { Card, Suit, Rank, Player, TrickPlayedCard, TrickResult, RoundResult } from './types.js';
 
 export const SUITS: Suit[] = ['spades', 'hearts', 'diamonds', 'clubs'];
 export const RANKS: Rank[] = ['7', '8', '9', '10', 'J', 'Q', 'K', 'A'];

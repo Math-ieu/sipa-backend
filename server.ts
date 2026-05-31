@@ -1,9 +1,9 @@
 import express from 'express';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { Card, GameState, ChatMessage } from './types';
-import { createDeck, dealCards, determineTrickWinner, calculateRoundResult } from './gameEngine';
-import { initDB, upsertUser, createMatch, updateMatchScores, endMatch, getUserStats, getUserMatches } from './db';
+import { Card, GameState, ChatMessage } from './types.js';
+import { createDeck, dealCards, determineTrickWinner, calculateRoundResult } from './gameEngine.js';
+import { initDB, upsertUser, createMatch, updateMatchScores, endMatch, getUserStats, getUserMatches } from './db.js';
 
 interface Room {
   roomId: string;
@@ -16,7 +16,7 @@ interface Room {
 
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 // Enable CORS so the separate Vercel frontend can call this backend in production
 app.use((req, res, next) => {
