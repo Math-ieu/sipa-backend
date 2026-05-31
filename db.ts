@@ -1,4 +1,6 @@
+import 'dotenv/config';
 import { Pool } from 'pg';
+import sqlite3 from 'sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -31,63 +33,69 @@ export interface DBMatchPlayer {
 }
 
 // Database Connection configuration
-const connectionString = process.env.POSTGRES_URL || process.env.DATABASE_URL;
+const dbType = process.env.DB_TYPE || (process.env.DATABASE_URL ? 'postgres' : 'sqlite');
+const connectionString = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+const sqlitePath = process.env.SQLITE_PATH || 'sipa.db';
+
 let pool: Pool | null = null;
-let useFallback = true;
+let sqliteDb: sqlite3.Database | null = null;
 
-const FALLBACK_FILE_PATH = path.join(process.cwd(), 'sipa_db_fallback.json');
-
-// Local fallback DB structure
-interface FallbackDB {
-  users: { [id: string]: DBUser };
-  matches: { [id: string]: DBMatch };
-  match_players: DBMatchPlayer[];
-}
-
-let fallbackData: FallbackDB = {
-  users: {},
-  matches: {},
-  match_players: [],
-};
-
-// Initialize fallback JSON file
-function loadFallbackData() {
-  try {
-    if (fs.existsSync(FALLBACK_FILE_PATH)) {
-      const content = fs.readFileSync(FALLBACK_FILE_PATH, 'utf-8');
-      fallbackData = JSON.parse(content);
-    } else {
-      saveFallbackData();
+/**
+ * Execute a query in SQLite returning a Promise compatible with PostgreSQL pg client response.
+ */
+function executeSql(sql: string, params: any[] = []): Promise<{ rows: any[] }> {
+  return new Promise((resolve, reject) => {
+    if (!sqliteDb) {
+      return reject(new Error('SQLite database is not initialized.'));
     }
-  } catch (err) {
-    console.error('Error loading local DB fallback file, starting fresh:', err);
+    
+    // Replace $1, $2, ... with ? for SQLite compatibility
+    const translatedSql = sql.replace(/\$\d+/g, '?');
+    
+    // Convert boolean values to 1 or 0 for SQLite
+    const convertedParams = params.map(p => typeof p === 'boolean' ? (p ? 1 : 0) : p);
+
+    sqliteDb.all(translatedSql, convertedParams, (err, rows) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve({ rows });
+      }
+    });
+  });
+}
+
+/**
+ * Unified query wrapper executing queries on PostgreSQL or SQLite depending on the environment.
+ */
+async function dbQuery(sql: string, params: any[] = []): Promise<{ rows: any[] }> {
+  if (pool) {
+    return await pool.query(sql, params);
+  } else if (sqliteDb) {
+    return await executeSql(sql, params);
+  } else {
+    throw new Error('No database connection initialized.');
   }
 }
 
-function saveFallbackData() {
-  try {
-    fs.writeFileSync(FALLBACK_FILE_PATH, JSON.stringify(fallbackData, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Error saving local DB fallback file:', err);
-  }
-}
-
-// Initialize Database connection and create tables
+/**
+ * Initialize Database connection and create tables
+ */
 export async function initDB(): Promise<boolean> {
-  if (connectionString) {
+  if (dbType === 'postgres' && connectionString) {
     try {
       console.log('Connecting to PostgreSQL database...');
       pool = new Pool({
         connectionString,
         ssl: {
-          rejectUnauthorized: false, // Required for Vercel/Neon serverless postgres
+          rejectUnauthorized: false, // Required for Railway/Neon/Vercel serverless postgres
         },
       });
 
       // Test connection
       await pool.query('SELECT NOW()');
 
-      // Create Tables
+      // Create Tables in PostgreSQL
       console.log('PostgreSQL connected. Creating tables if not existing...');
       
       await pool.query(`
@@ -122,21 +130,70 @@ export async function initDB(): Promise<boolean> {
         );
       `);
 
-      useFallback = false;
       console.log('PostgreSQL database successfully initialized.');
       return true;
     } catch (err) {
-      console.warn('PostgreSQL connection failed. Falling back to local JSON database storage.');
-      console.warn('Reason:', err instanceof Error ? err.message : err);
+      console.error('PostgreSQL connection or initialization failed:', err instanceof Error ? err.message : err);
+      throw err;
     }
   } else {
-    console.log('No DATABASE_URL or POSTGRES_URL provided. Operating in local fallback JSON database mode.');
-  }
+    // SQLite Setup
+    try {
+      console.log(`Connecting to SQLite database (${sqlitePath})...`);
+      const absolutePath = path.isAbsolute(sqlitePath) ? sqlitePath : path.join(process.cwd(), sqlitePath);
+      
+      // Ensure the directory exists
+      const dir = path.dirname(absolutePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
 
-  // Fallback Setup
-  loadFallbackData();
-  useFallback = true;
-  return false;
+      sqliteDb = new sqlite3.Database(absolutePath);
+
+      // Enable foreign keys in SQLite
+      await executeSql('PRAGMA foreign_keys = ON');
+
+      console.log('SQLite connected. Creating tables if not existing...');
+      
+      await executeSql(`
+        CREATE TABLE IF NOT EXISTS sipa_users (
+          id TEXT PRIMARY KEY,
+          username TEXT NOT NULL,
+          avatar_id TEXT NOT NULL,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      await executeSql(`
+        CREATE TABLE IF NOT EXISTS sipa_matches (
+          id TEXT PRIMARY KEY,
+          room_id TEXT NOT NULL,
+          game_mode TEXT NOT NULL,
+          status TEXT NOT NULL,
+          winner_id TEXT REFERENCES sipa_users(id) ON DELETE SET NULL,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          ended_at TEXT
+        );
+      `);
+
+      await executeSql(`
+        CREATE TABLE IF NOT EXISTS sipa_match_players (
+          match_id TEXT REFERENCES sipa_matches(id) ON DELETE CASCADE,
+          player_id TEXT NOT NULL,
+          score INTEGER NOT NULL DEFAULT 0,
+          is_host INTEGER NOT NULL DEFAULT 0,
+          is_ai INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (match_id, player_id)
+        );
+      `);
+
+      console.log('SQLite database successfully initialized.');
+      return true;
+    } catch (err) {
+      console.error('SQLite connection or initialization failed:', err instanceof Error ? err.message : err);
+      throw err;
+    }
+  }
 }
 
 // -------------------------------------------------------------
@@ -150,30 +207,19 @@ export async function upsertUser(id: string, username: string, avatarId: string)
   const normalizedUsername = username.trim() || `Joueur_${id.substring(0, 5)}`;
   const normalizedAvatarId = avatarId || 'av1';
 
-  if (!useFallback && pool) {
-    try {
-      await pool.query(
-        `INSERT INTO sipa_users (id, username, avatar_id)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (id) 
-         DO UPDATE SET username = $2, avatar_id = $3`,
-        [id, normalizedUsername, normalizedAvatarId]
-      );
-      return { id, username: normalizedUsername, avatar_id: normalizedAvatarId };
-    } catch (err) {
-      console.error('Error in Postgres upsertUser:', err);
-    }
+  try {
+    await dbQuery(
+      `INSERT INTO sipa_users (id, username, avatar_id)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (id) 
+       DO UPDATE SET username = EXCLUDED.username, avatar_id = EXCLUDED.avatar_id`,
+      [id, normalizedUsername, normalizedAvatarId]
+    );
+    return { id, username: normalizedUsername, avatar_id: normalizedAvatarId };
+  } catch (err) {
+    console.error('Error in upsertUser:', err);
+    throw err;
   }
-
-  // Fallback mode
-  fallbackData.users[id] = {
-    id,
-    username: normalizedUsername,
-    avatar_id: normalizedAvatarId,
-    created_at: fallbackData.users[id]?.created_at || new Date().toISOString(),
-  };
-  saveFallbackData();
-  return fallbackData.users[id];
 }
 
 /**
@@ -191,49 +237,25 @@ export async function createMatch(
     await upsertUser(player.id, player.name, player.avatarId || 'av1');
   }
 
-  if (!useFallback && pool) {
-    try {
-      await pool.query(
-        `INSERT INTO sipa_matches (id, room_id, game_mode, status)
-         VALUES ($1, $2, $3, 'playing')`,
-        [matchId, roomId, gameMode]
+  try {
+    await dbQuery(
+      `INSERT INTO sipa_matches (id, room_id, game_mode, status)
+       VALUES ($1, $2, $3, 'playing')`,
+      [matchId, roomId, gameMode]
+    );
+
+    for (const player of players) {
+      await dbQuery(
+        `INSERT INTO sipa_match_players (match_id, player_id, score, is_host, is_ai)
+         VALUES ($1, $2, 0, $3, $4)`,
+        [matchId, player.id, player.isHost, player.isAI]
       );
-
-      for (const player of players) {
-        await pool.query(
-          `INSERT INTO sipa_match_players (match_id, player_id, score, is_host, is_ai)
-           VALUES ($1, $2, 0, $3, $4)`,
-          [matchId, player.id, player.isHost, player.isAI]
-        );
-      }
-      return matchId;
-    } catch (err) {
-      console.error('Error in Postgres createMatch:', err);
     }
+    return matchId;
+  } catch (err) {
+    console.error('Error in createMatch:', err);
+    throw err;
   }
-
-  // Fallback mode
-  fallbackData.matches[matchId] = {
-    id: matchId,
-    room_id: roomId,
-    game_mode: gameMode,
-    status: 'playing',
-    winner_id: null,
-    created_at: new Date().toISOString(),
-    ended_at: null,
-  };
-
-  for (const player of players) {
-    fallbackData.match_players.push({
-      match_id: matchId,
-      player_id: player.id,
-      score: 0,
-      is_host: player.isHost,
-      is_ai: player.isAI,
-    });
-  }
-  saveFallbackData();
-  return matchId;
 }
 
 /**
@@ -243,228 +265,135 @@ export async function updateMatchScores(
   matchId: string,
   scores: { [playerId: string]: number }
 ): Promise<boolean> {
-  if (!useFallback && pool) {
-    try {
-      for (const [playerId, score] of Object.entries(scores)) {
-        await pool.query(
-          `UPDATE sipa_match_players 
-           SET score = $1 
-           WHERE match_id = $2 AND player_id = $3`,
-          [score, matchId, playerId]
-        );
-      }
-      return true;
-    } catch (err) {
-      console.error('Error in Postgres updateMatchScores:', err);
+  try {
+    for (const [playerId, score] of Object.entries(scores)) {
+      await dbQuery(
+        `UPDATE sipa_match_players 
+         SET score = $1 
+         WHERE match_id = $2 AND player_id = $3`,
+        [score, matchId, playerId]
+      );
     }
+    return true;
+  } catch (err) {
+    console.error('Error in updateMatchScores:', err);
+    return false;
   }
-
-  // Fallback mode
-  let updated = false;
-  fallbackData.match_players = fallbackData.match_players.map((mp) => {
-    if (mp.match_id === matchId && scores[mp.player_id] !== undefined) {
-      updated = true;
-      return { ...mp, score: scores[mp.player_id] };
-    }
-    return mp;
-  });
-
-  if (updated) {
-    saveFallbackData();
-  }
-  return updated;
 }
 
 /**
  * Finalize a match with a declared winner
  */
 export async function endMatch(matchId: string, winnerId: string | null): Promise<boolean> {
-  if (!useFallback && pool) {
-    try {
-      await pool.query(
-        `UPDATE sipa_matches 
-         SET status = 'completed', winner_id = $1, ended_at = CURRENT_TIMESTAMP 
-         WHERE id = $2`,
-        [winnerId, matchId]
-      );
-      return true;
-    } catch (err) {
-      console.error('Error in Postgres endMatch:', err);
-    }
-  }
-
-  // Fallback mode
-  if (fallbackData.matches[matchId]) {
-    fallbackData.matches[matchId].status = 'completed';
-    fallbackData.matches[matchId].winner_id = winnerId;
-    fallbackData.matches[matchId].ended_at = new Date().toISOString();
-    saveFallbackData();
+  try {
+    await dbQuery(
+      `UPDATE sipa_matches 
+       SET status = 'completed', winner_id = $1, ended_at = CURRENT_TIMESTAMP 
+       WHERE id = $2`,
+      [winnerId, matchId]
+    );
     return true;
+  } catch (err) {
+    console.error('Error in endMatch:', err);
+    return false;
   }
-  return false;
 }
 
 /**
  * Retrieve comprehensive playing statistics for a user
  */
 export async function getUserStats(playerId: string) {
-  if (!useFallback && pool) {
-    try {
-      // Total matches played
-      const totalRes = await pool.query(
-        `SELECT COUNT(DISTINCT match_id) as count 
-         FROM sipa_match_players 
-         WHERE player_id = $1`,
-        [playerId]
-      );
-      const totalMatches = parseInt(totalRes.rows[0]?.count || '0', 10);
+  try {
+    // Total matches played
+    const totalRes = await dbQuery(
+      `SELECT COUNT(DISTINCT match_id) as count 
+       FROM sipa_match_players 
+       WHERE player_id = $1`,
+      [playerId]
+    );
+    const totalMatches = parseInt(totalRes.rows[0]?.count || '0', 10);
 
-      // Total wins
-      const winsRes = await pool.query(
-        `SELECT COUNT(*) as count 
-         FROM sipa_matches 
-         WHERE winner_id = $1 AND status = 'completed'`,
-        [playerId]
-      );
-      const wins = parseInt(winsRes.rows[0]?.count || '0', 10);
+    // Total wins
+    const winsRes = await dbQuery(
+      `SELECT COUNT(*) as count 
+       FROM sipa_matches 
+       WHERE winner_id = $1 AND status = 'completed'`,
+      [playerId]
+    );
+    const wins = parseInt(winsRes.rows[0]?.count || '0', 10);
 
-      const losses = Math.max(0, totalMatches - wins);
-      const winRate = totalMatches > 0 ? Math.round((wins / totalMatches) * 100) : 0;
+    const losses = Math.max(0, totalMatches - wins);
+    const winRate = totalMatches > 0 ? Math.round((wins / totalMatches) * 100) : 0;
 
-      return {
-        totalMatches,
-        wins,
-        losses,
-        winRate,
-      };
-    } catch (err) {
-      console.error('Error in Postgres getUserStats:', err);
-    }
+    return {
+      totalMatches,
+      wins,
+      losses,
+      winRate,
+    };
+  } catch (err) {
+    console.error('Error in getUserStats:', err);
+    return {
+      totalMatches: 0,
+      wins: 0,
+      losses: 0,
+      winRate: 0,
+    };
   }
-
-  // Fallback mode
-  const userMatchIds = fallbackData.match_players
-    .filter((mp) => mp.player_id === playerId)
-    .map((mp) => mp.match_id);
-
-  const uniqueMatchIds = Array.from(new Set(userMatchIds));
-  const totalMatches = uniqueMatchIds.length;
-
-  let wins = 0;
-  for (const mId of uniqueMatchIds) {
-    const match = fallbackData.matches[mId];
-    if (match && match.winner_id === playerId && match.status === 'completed') {
-      wins++;
-    }
-  }
-
-  const losses = Math.max(0, totalMatches - wins);
-  const winRate = totalMatches > 0 ? Math.round((wins / totalMatches) * 100) : 0;
-
-  return {
-    totalMatches,
-    wins,
-    losses,
-    winRate,
-  };
 }
 
 /**
  * Retrieve a list of recent matches played by a player, including participants and final scores
  */
 export async function getUserMatches(playerId: string) {
-  if (!useFallback && pool) {
-    try {
-      // 1. Fetch matches the user participated in
-      const matchesRes = await pool.query(
-        `SELECT m.id, m.room_id, m.game_mode, m.status, m.winner_id, m.created_at, m.ended_at
-         FROM sipa_matches m
-         JOIN sipa_match_players mp ON m.id = mp.match_id
-         WHERE mp.player_id = $1
-         ORDER BY m.created_at DESC
-         LIMIT 10`,
-        [playerId]
+  try {
+    // 1. Fetch matches the user participated in
+    const matchesRes = await dbQuery(
+      `SELECT m.id, m.room_id, m.game_mode, m.status, m.winner_id, m.created_at, m.ended_at
+       FROM sipa_matches m
+       JOIN sipa_match_players mp ON m.id = mp.match_id
+       WHERE mp.player_id = $1
+       ORDER BY m.created_at DESC
+       LIMIT 10`,
+      [playerId]
+    );
+
+    const matches = [];
+
+    for (const row of matchesRes.rows) {
+      // Fetch all players for this match
+      const playersRes = await dbQuery(
+        `SELECT mp.player_id, mp.score, mp.is_host, mp.is_ai, u.username, u.avatar_id
+         FROM sipa_match_players mp
+         LEFT JOIN sipa_users u ON mp.player_id = u.id
+         WHERE mp.match_id = $1`,
+        [row.id]
       );
 
-      const matches = [];
+      const players = playersRes.rows.map((p) => ({
+        playerId: p.player_id,
+        name: p.username || (p.is_ai ? p.player_id : 'Joueur'),
+        score: p.score,
+        isHost: !!p.is_host, // Coerce numeric (0 or 1) and true/false to boolean
+        isAI: !!p.is_ai,     // Coerce numeric (0 or 1) and true/false to boolean
+        avatarId: p.avatar_id || 'av1',
+      }));
 
-      for (const row of matchesRes.rows) {
-        // Fetch all players for this match
-        const playersRes = await pool.query(
-          `SELECT mp.player_id, mp.score, mp.is_host, mp.is_ai, u.username, u.avatar_id
-           FROM sipa_match_players mp
-           LEFT JOIN sipa_users u ON mp.player_id = u.id
-           WHERE mp.match_id = $1`,
-          [row.id]
-        );
-
-        const players = playersRes.rows.map((p) => ({
-          playerId: p.player_id,
-          name: p.username || (p.is_ai ? p.player_id : 'Joueur'),
-          score: p.score,
-          isHost: p.is_host,
-          isAI: p.is_ai,
-          avatarId: p.avatar_id || 'av1',
-        }));
-
-        matches.push({
-          matchId: row.id,
-          roomId: row.room_id,
-          gameMode: row.game_mode,
-          status: row.status,
-          winnerId: row.winner_id,
-          createdAt: row.created_at,
-          endedAt: row.ended_at,
-          players,
-        });
-      }
-
-      return matches;
-    } catch (err) {
-      console.error('Error in Postgres getUserMatches:', err);
-    }
-  }
-
-  // Fallback mode
-  const userMatchIds = fallbackData.match_players
-    .filter((mp) => mp.player_id === playerId)
-    .map((mp) => mp.match_id);
-
-  // Filter unique and sort matches by creation date descending
-  const uniqueMatchIds = Array.from(new Set(userMatchIds));
-  const matchesList = uniqueMatchIds
-    .map((mId) => fallbackData.matches[mId])
-    .filter(Boolean)
-    .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
-    .slice(0, 10);
-
-  const result = [];
-  for (const m of matchesList) {
-    const playersForMatch = fallbackData.match_players
-      .filter((mp) => mp.match_id === m.id)
-      .map((mp) => {
-        const user = fallbackData.users[mp.player_id];
-        return {
-          playerId: mp.player_id,
-          name: user ? user.username : (mp.is_ai ? mp.player_id : 'Joueur'),
-          score: mp.score,
-          isHost: mp.is_host,
-          isAI: mp.is_ai,
-          avatarId: user ? user.avatar_id : 'av1',
-        };
+      matches.push({
+        matchId: row.id,
+        roomId: row.room_id,
+        gameMode: row.game_mode,
+        status: row.status,
+        winnerId: row.winner_id,
+        createdAt: row.created_at,
+        endedAt: row.ended_at,
+        players,
       });
+    }
 
-    result.push({
-      matchId: m.id,
-      roomId: m.room_id,
-      gameMode: m.game_mode,
-      status: m.status,
-      winnerId: m.winner_id,
-      createdAt: m.created_at,
-      endedAt: m.ended_at,
-      players: playersForMatch,
-    });
+    return matches;
+  } catch (err) {
+    console.error('Error in getUserMatches:', err);
+    return [];
   }
-
-  return result;
 }

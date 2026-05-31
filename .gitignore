@@ -2,3 +2,6 @@ node_modules/
 dist/
 .env
 sipa_db_fallback.json
+*.db
+*.db-journal
+*.sqlite
