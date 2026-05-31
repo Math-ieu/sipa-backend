@@ -20,7 +20,23 @@ const PORT = Number(process.env.PORT || 3000);
 
 // Enable CORS so the separate Vercel frontend can call this backend in production
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  const frontendUrl = process.env.FRONTEND_URL;
+  const origin = req.headers.origin;
+
+  if (frontendUrl) {
+    const normalizedFrontend = frontendUrl.replace(/\/$/, '');
+    if (origin) {
+      const normalizedOrigin = origin.replace(/\/$/, '');
+      if (normalizedOrigin !== normalizedFrontend) {
+        console.warn(`[CORS Blocked] Request origin '${origin}' does not match allowed FRONTEND_URL '${frontendUrl}'`);
+        return res.status(403).send('Forbidden: Origin not allowed');
+      }
+    }
+    res.header('Access-Control-Allow-Origin', frontendUrl);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') {
@@ -173,6 +189,21 @@ function broadcastRoomState(room: Room) {
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
+  const frontendUrl = process.env.FRONTEND_URL;
+  const origin = request.headers.origin;
+
+  if (frontendUrl && origin) {
+    const normalizedFrontend = frontendUrl.replace(/\/$/, '');
+    const normalizedOrigin = origin.replace(/\/$/, '');
+
+    if (normalizedOrigin !== normalizedFrontend) {
+      console.warn(`[WS Blocked] WebSocket upgrade rejected for origin '${origin}'. Expected '${frontendUrl}'`);
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+  }
+
   const urlObj = new URL(request.url || '', `http://${request.headers.host}`);
   const pathname = urlObj.pathname;
   if (pathname === '/ws') {
