@@ -1,9 +1,24 @@
 import express from 'express';
 import http from 'http';
+import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Card, GameState, ChatMessage } from './types.js';
 import { createDeck, dealCards, determineTrickWinner, calculateRoundResult } from './gameEngine.js';
-import { initDB, upsertUser, createMatch, updateMatchScores, endMatch, getUserStats, getUserMatches } from './db.js';
+import { 
+  initDB, 
+  upsertUser, 
+  createMatch, 
+  updateMatchScores, 
+  endMatch, 
+  getUserStats, 
+  getUserMatches,
+  getUserByUsername,
+  createUser,
+  createSession,
+  getSession,
+  deleteSession,
+  getUserById
+} from './db.js';
 
 interface Room {
   roomId: string;
@@ -87,6 +102,210 @@ app.post('/api/create-room', (req, res) => {
   res.json({ roomId });
 });
 
+// -------------------------------------------------------------
+// Authentication and Registration Endpoints (with Rate Limiting & Input Sanitization)
+// -------------------------------------------------------------
+
+// Simple in-memory rate limiter to protect database from brute force or registration floods
+interface RateLimitInfo {
+  count: number;
+  resetTime: number;
+}
+const rateLimits = new Map<string, RateLimitInfo>();
+
+function rateLimiter(maxRequests: number, windowMs: number) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    
+    let limitInfo = rateLimits.get(ip);
+    if (!limitInfo || now > limitInfo.resetTime) {
+      limitInfo = {
+        count: 0,
+        resetTime: now + windowMs
+      };
+    }
+    
+    limitInfo.count++;
+    rateLimits.set(ip, limitInfo);
+    
+    if (limitInfo.count > maxRequests) {
+      console.warn(`[Rate Limit Exceeded] IP ${ip} exceeded limit for path ${req.path}`);
+      return res.status(429).json({ error: "Trop de requêtes. Veuillez réessayer plus tard." });
+    }
+    next();
+  };
+}
+
+// Helper functions for secure password hashing using Node's native scrypt
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password: string, storedHash: string): boolean {
+  const [salt, hash] = storedHash.split(':');
+  if (!salt || !hash) return false;
+  const verifyHash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return hash === verifyHash;
+}
+
+// Inscription d'un nouvel utilisateur (avec Honeypot, Rate Limiter et Sanitization)
+app.post('/api/auth/register', rateLimiter(5, 15 * 60 * 1000), async (req, res) => {
+  try {
+    const { username, password, avatarId, email_confirm } = req.body;
+
+    // Protection anti-bot Honeypot
+    if (email_confirm) {
+      console.warn('[Bot Detected] Honeypot field was filled during registration!');
+      return res.status(400).json({ error: "Validation anti-bot échouée." });
+    }
+
+    if (!username || !password) {
+      return res.status(400).json({ error: "Le pseudo et le mot de passe sont requis." });
+    }
+
+    const trimmedUsername = username.trim();
+    const usernameRegex = /^[a-zA-Z0-9_\-]{3,16}$/;
+    if (!usernameRegex.test(trimmedUsername)) {
+      return res.status(400).json({ error: "Le pseudo doit contenir entre 3 et 16 caractères et ne peut inclure que des lettres, chiffres, tirets (-) et underscores (_)." });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: "Le mot de passe doit contenir au moins 6 caractères." });
+    }
+
+    // Vérifier si le pseudo est déjà pris par un utilisateur inscrit
+    const existingUser = await getUserByUsername(trimmedUsername);
+    if (existingUser && existingUser.password_hash) {
+      return res.status(400).json({ error: "Ce pseudo est déjà utilisé par un compte enregistré." });
+    }
+
+    // Créer l'utilisateur
+    const passwordHash = hashPassword(password);
+    const playerId = `user_${Math.random().toString(36).substring(2, 11)}_${Date.now()}`;
+    const avatar = String(avatarId || 'av1').trim().substring(0, 10).replace(/[^a-zA-Z0-9_\-]/g, '');
+
+    const newUser = await createUser(playerId, trimmedUsername, passwordHash, avatar);
+
+    // Créer la session (expire dans 7 jours)
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    await createSession(token, playerId, expiresAt);
+
+    res.json({
+      token,
+      user: {
+        id: newUser.id,
+        username: newUser.username,
+        avatarId: newUser.avatar_id
+      }
+    });
+  } catch (err) {
+    console.error('Erreur dans /api/auth/register :', err);
+    res.status(500).json({ error: "Erreur lors de la création du compte." });
+  }
+});
+
+// Connexion de l'utilisateur (avec Rate Limiter)
+app.post('/api/auth/login', rateLimiter(15, 5 * 60 * 1000), async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: "Le pseudo et le mot de passe sont requis." });
+    }
+
+    const trimmedUsername = String(username).trim();
+    const usernameRegex = /^[a-zA-Z0-9_\-]{3,16}$/;
+    if (!usernameRegex.test(trimmedUsername)) {
+      return res.status(401).json({ error: "Pseudo ou mot de passe incorrect." });
+    }
+
+    const user = await getUserByUsername(trimmedUsername);
+    if (!user || !user.password_hash) {
+      return res.status(401).json({ error: "Pseudo ou mot de passe incorrect." });
+    }
+
+    const isValid = verifyPassword(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: "Pseudo ou mot de passe incorrect." });
+    }
+
+    // Créer la session (expire dans 7 jours)
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    await createSession(token, user.id, expiresAt);
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        avatarId: user.avatar_id
+      }
+    });
+  } catch (err) {
+    console.error('Erreur dans /api/auth/login :', err);
+    res.status(500).json({ error: "Erreur lors de la connexion." });
+  }
+});
+
+// Récupération de la session de l'utilisateur connecté
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: "Jeton de session absent." });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const session = await getSession(token);
+    if (!session) {
+      return res.status(401).json({ error: "Session invalide ou expirée." });
+    }
+
+    // Vérifier l'expiration
+    const expiresDate = new Date(session.expires_at);
+    if (expiresDate.getTime() < Date.now()) {
+      await deleteSession(token);
+      return res.status(401).json({ error: "Session expirée." });
+    }
+
+    // Récupérer l'utilisateur
+    const user = await getUserById(session.user_id);
+    if (!user) {
+      return res.status(401).json({ error: "Utilisateur introuvable." });
+    }
+
+    res.json({
+      user: {
+        id: user.id,
+        username: user.username,
+        avatarId: user.avatar_id
+      }
+    });
+  } catch (err) {
+    console.error('Erreur dans /api/auth/me :', err);
+    res.status(500).json({ error: "Erreur lors de la récupération du profil." });
+  }
+});
+
+// Déconnexion de l'utilisateur
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      await deleteSession(token);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Erreur dans /api/auth/logout :', err);
+    res.status(500).json({ error: "Erreur lors de la déconnexion." });
+  }
+});
+
 // Enregistrement/mise à jour du pseudo et sceau
 app.post('/api/users', async (req, res) => {
   try {
@@ -94,7 +313,13 @@ app.post('/api/users', async (req, res) => {
     if (!playerId) {
       return res.status(400).json({ error: "playerId est requis" });
     }
-    const user = await upsertUser(playerId, playerName, avatarId);
+    
+    // Strict input filtering and escape to block SQLi and malicious payloads
+    const sanitizedPlayerId = String(playerId).trim().substring(0, 50).replace(/[^a-zA-Z0-9_\-]/g, '');
+    const sanitizedPlayerName = String(playerName || '').trim().substring(0, 16).replace(/[<>]/g, '');
+    const sanitizedAvatarId = String(avatarId || 'av1').trim().substring(0, 10).replace(/[^a-zA-Z0-9_\-]/g, '');
+
+    const user = await upsertUser(sanitizedPlayerId, sanitizedPlayerName, sanitizedAvatarId);
     res.json(user);
   } catch (err) {
     console.error('Erreur dans /api/users :', err);
@@ -106,7 +331,8 @@ app.post('/api/users', async (req, res) => {
 app.get('/api/users/:playerId/stats', async (req, res) => {
   try {
     const { playerId } = req.params;
-    const stats = await getUserStats(playerId);
+    const sanitizedPlayerId = String(playerId).trim().substring(0, 50).replace(/[^a-zA-Z0-9_\-]/g, '');
+    const stats = await getUserStats(sanitizedPlayerId);
     res.json(stats);
   } catch (err) {
     console.error('Erreur dans /api/users/:playerId/stats :', err);
@@ -118,7 +344,8 @@ app.get('/api/users/:playerId/stats', async (req, res) => {
 app.get('/api/users/:playerId/matches', async (req, res) => {
   try {
     const { playerId } = req.params;
-    const matches = await getUserMatches(playerId);
+    const sanitizedPlayerId = String(playerId).trim().substring(0, 50).replace(/[^a-zA-Z0-9_\-]/g, '');
+    const matches = await getUserMatches(sanitizedPlayerId);
     res.json(matches);
   } catch (err) {
     console.error('Erreur dans /api/users/:playerId/matches :', err);
@@ -133,13 +360,30 @@ app.post('/api/matches/end-local', async (req, res) => {
     if (!players || !Array.isArray(players)) {
       return res.status(400).json({ error: "players est requis et doit être un tableau" });
     }
-    const matchId = await createMatch(roomId || 'local', gameMode || 'ai', players);
+
+    // Protection par assainissement rigoureux des entrées pour la base de données
+    const sanitizedRoomId = String(roomId || 'local').trim().substring(0, 50).replace(/[^a-zA-Z0-9_\-]/g, '');
+    const sanitizedGameMode = String(gameMode || 'ai').trim().substring(0, 20).replace(/[^a-zA-Z0-9_\-]/g, '');
+    const sanitizedWinnerId = winnerId ? String(winnerId).trim().substring(0, 50).replace(/[^a-zA-Z0-9_\-]/g, '') : null;
+
+    const sanitizedPlayers = players.map((p: any) => {
+      return {
+        id: String(p.id || '').trim().substring(0, 50).replace(/[^a-zA-Z0-9_\-]/g, ''),
+        name: String(p.name || '').trim().substring(0, 16).replace(/[<>]/g, ''), // Bloque XSS injecté dans le pseudo
+        isHost: !!p.isHost,
+        isAI: !!p.isAI,
+        avatarId: String(p.avatarId || 'av1').trim().substring(0, 10).replace(/[^a-zA-Z0-9_\-]/g, ''),
+        score: typeof p.score === 'number' ? p.score : 0
+      };
+    });
+
+    const matchId = await createMatch(sanitizedRoomId, sanitizedGameMode, sanitizedPlayers);
     const scoresMap: { [id: string]: number } = {};
-    players.forEach((p) => {
-      scoresMap[p.id] = p.score || 0;
+    sanitizedPlayers.forEach((p) => {
+      scoresMap[p.id] = p.score;
     });
     await updateMatchScores(matchId, scoresMap);
-    await endMatch(matchId, winnerId || null);
+    await endMatch(matchId, sanitizedWinnerId);
     res.json({ success: true, matchId });
   } catch (err) {
     console.error('Erreur dans /api/matches/end-local :', err);
@@ -222,7 +466,14 @@ wss.on('connection', (ws) => {
 
       if (data.type === 'join') {
         const { roomId, playerId, playerName, avatarId } = data.payload;
-        const room = rooms.get(roomId);
+        
+        // Strict input sanitization for WS payloads to prevent injection or malicious clients
+        const sanitizedRoomId = String(roomId || '').trim().substring(0, 10).replace(/[^a-zA-Z0-9_\-]/g, '');
+        const sanitizedPlayerId = String(playerId || '').trim().substring(0, 50).replace(/[^a-zA-Z0-9_\-]/g, '');
+        const sanitizedPlayerName = String(playerName || '').trim().substring(0, 16).replace(/[<>]/g, '');
+        const sanitizedAvatarId = String(avatarId || 'av1').trim().substring(0, 10).replace(/[^a-zA-Z0-9_\-]/g, '');
+
+        const room = rooms.get(sanitizedRoomId);
 
         if (!room) {
           ws.send(JSON.stringify({
@@ -233,7 +484,7 @@ wss.on('connection', (ws) => {
         }
 
         const players = room.gameState.players;
-        const existingPlayerIdx = players.findIndex(p => p.id === playerId);
+        const existingPlayerIdx = players.findIndex(p => p.id === sanitizedPlayerId);
 
         if (existingPlayerIdx === -1) {
           if (players.length >= 4) {
@@ -253,22 +504,22 @@ wss.on('connection', (ws) => {
 
           const isHost = players.length === 0;
           players.push({
-            id: playerId,
-            name: playerName,
+            id: sanitizedPlayerId,
+            name: sanitizedPlayerName,
             score: 0,
             hand: [],
             isAI: false,
             isHost,
-            avatarId
+            avatarId: sanitizedAvatarId
           });
         } else {
-          players[existingPlayerIdx].name = playerName;
-          players[existingPlayerIdx].avatarId = avatarId;
+          players[existingPlayerIdx].name = sanitizedPlayerName;
+          players[existingPlayerIdx].avatarId = sanitizedAvatarId;
         }
 
-        room.clients.set(playerId, ws);
-        clientRoomIds.set(ws, roomId);
-        clientPlayerIds.set(ws, playerId);
+        room.clients.set(sanitizedPlayerId, ws);
+        clientRoomIds.set(ws, sanitizedRoomId);
+        clientPlayerIds.set(ws, sanitizedPlayerId);
 
         if (room.gameState.status === 'lobby' && players.length > 0) {
           room.gameState.currentLeaderId = players[0].id;
@@ -289,7 +540,8 @@ wss.on('connection', (ws) => {
       }
 
       if (data.type === 'start_game') {
-        const { roomId } = data.payload;
+        const roomId = clientRoomIds.get(ws);
+        if (!roomId) return;
         const room = rooms.get(roomId);
         if (!room) return;
 
@@ -337,7 +589,10 @@ wss.on('connection', (ws) => {
       }
 
       if (data.type === 'play_card') {
-        const { roomId, playerId, card, playerName } = data.payload;
+        const roomId = clientRoomIds.get(ws);
+        const playerId = clientPlayerIds.get(ws);
+        if (!roomId || !playerId) return;
+
         const room = rooms.get(roomId);
         if (!room) return;
 
@@ -347,6 +602,9 @@ wss.on('connection', (ws) => {
 
         const activePlayer = players[room.gameState.activePlayerIndex];
         if (!activePlayer || activePlayer.id !== playerId) return;
+
+        const { card } = data.payload;
+        const playerName = activePlayer.name;
 
         currentTrickCards.push({
           playerId,
@@ -419,7 +677,8 @@ wss.on('connection', (ws) => {
       }
 
       if (data.type === 'deal_next_round') {
-        const { roomId } = data.payload;
+        const roomId = clientRoomIds.get(ws);
+        if (!roomId) return;
         const room = rooms.get(roomId);
         if (!room) return;
 
@@ -452,7 +711,8 @@ wss.on('connection', (ws) => {
       }
 
       if (data.type === 'reset_scores') {
-        const { roomId } = data.payload;
+        const roomId = clientRoomIds.get(ws);
+        if (!roomId) return;
         const room = rooms.get(roomId);
         if (!room) return;
 
@@ -478,16 +738,25 @@ wss.on('connection', (ws) => {
       }
 
       if (data.type === 'send_message') {
-        const { roomId, senderId, senderName, avatarId, text } = data.payload;
+        const roomId = clientRoomIds.get(ws);
+        const senderId = clientPlayerIds.get(ws);
+        if (!roomId || !senderId) return;
+
         const room = rooms.get(roomId);
         if (!room) return;
 
+        const player = room.gameState.players.find(p => p.id === senderId);
+        if (!player) return;
+
+        const { text } = data.payload;
+        const sanitizedText = String(text || '').trim().substring(0, 200).replace(/[<>]/g, '');
+
         const chatMsg: ChatMessage = {
-          id: 'msg_' + Math.random().toString(36).substring(2, 11),
-          senderId,
-          senderName,
-          avatarId,
-          text,
+          id: 'msg_' + crypto.randomUUID().substring(0, 8) + '_' + Date.now(),
+          senderId: player.id,
+          senderName: player.name,
+          avatarId: player.avatarId || 'av1',
+          text: sanitizedText,
           timestamp: new Date().toISOString()
         };
 

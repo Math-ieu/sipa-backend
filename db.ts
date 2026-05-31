@@ -9,7 +9,14 @@ export interface DBUser {
   id: string;
   username: string;
   avatar_id: string;
+  password_hash?: string;
   created_at?: string;
+}
+
+export interface DBSession {
+  token: string;
+  user_id: string;
+  expires_at: string;
 }
 
 export interface DBMatch {
@@ -107,6 +114,19 @@ export async function initDB(): Promise<boolean> {
         );
       `);
 
+      // Migration: Add password_hash if not existing
+      await pool.query(`
+        ALTER TABLE sipa_users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
+      `);
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS sipa_sessions (
+          token VARCHAR(255) PRIMARY KEY,
+          user_id VARCHAR(50) REFERENCES sipa_users(id) ON DELETE CASCADE,
+          expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+        );
+      `);
+
       await pool.query(`
         CREATE TABLE IF NOT EXISTS sipa_matches (
           id VARCHAR(50) PRIMARY KEY,
@@ -161,6 +181,22 @@ export async function initDB(): Promise<boolean> {
           username TEXT NOT NULL,
           avatar_id TEXT NOT NULL,
           created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // Migration: check if password_hash exists, if not add it
+      const tableInfo = await executeSql("PRAGMA table_info(sipa_users)");
+      const hasPasswordHash = tableInfo.rows.some((row: any) => row.name === 'password_hash');
+      if (!hasPasswordHash) {
+        console.log('Adding password_hash column to sipa_users in SQLite...');
+        await executeSql("ALTER TABLE sipa_users ADD COLUMN password_hash TEXT");
+      }
+
+      await executeSql(`
+        CREATE TABLE IF NOT EXISTS sipa_sessions (
+          token TEXT PRIMARY KEY,
+          user_id TEXT REFERENCES sipa_users(id) ON DELETE CASCADE,
+          expires_at TEXT NOT NULL
         );
       `);
 
@@ -397,3 +433,135 @@ export async function getUserMatches(playerId: string) {
     return [];
   }
 }
+
+// -------------------------------------------------------------
+// Authentication and Session Database Operations
+// -------------------------------------------------------------
+
+/**
+ * Retrieve user by exact username (case-insensitive), prioritizing registered accounts
+ */
+export async function getUserByUsername(username: string): Promise<DBUser | null> {
+  try {
+    const res = await dbQuery(
+      `SELECT id, username, avatar_id, password_hash, created_at 
+       FROM sipa_users 
+       WHERE LOWER(username) = LOWER($1)
+       ORDER BY password_hash DESC
+       LIMIT 1`,
+      [username.trim()]
+    );
+    if (res.rows.length === 0) return null;
+    const row = res.rows[0];
+    return {
+      id: row.id,
+      username: row.username,
+      avatar_id: row.avatar_id,
+      password_hash: row.password_hash,
+      created_at: row.created_at
+    };
+  } catch (err) {
+    console.error('Error in getUserByUsername:', err);
+    throw err;
+  }
+}
+
+/**
+ * Retrieve user by their unique ID
+ */
+export async function getUserById(id: string): Promise<DBUser | null> {
+  try {
+    const res = await dbQuery(
+      `SELECT id, username, avatar_id, password_hash, created_at 
+       FROM sipa_users 
+       WHERE id = $1`,
+      [id]
+    );
+    if (res.rows.length === 0) return null;
+    const row = res.rows[0];
+    return {
+      id: row.id,
+      username: row.username,
+      avatar_id: row.avatar_id,
+      password_hash: row.password_hash,
+      created_at: row.created_at
+    };
+  } catch (err) {
+    console.error('Error in getUserById:', err);
+    throw err;
+  }
+}
+
+/**
+ * Insert a brand new registered user
+ */
+export async function createUser(id: string, username: string, passwordHash: string, avatarId: string): Promise<DBUser> {
+  const normalizedUsername = username.trim();
+  const normalizedAvatarId = avatarId || 'av1';
+
+  try {
+    await dbQuery(
+      `INSERT INTO sipa_users (id, username, avatar_id, password_hash)
+       VALUES ($1, $2, $3, $4)`,
+      [id, normalizedUsername, normalizedAvatarId, passwordHash]
+    );
+    return { id, username: normalizedUsername, avatar_id: normalizedAvatarId };
+  } catch (err) {
+    console.error('Error in createUser:', err);
+    throw err;
+  }
+}
+
+/**
+ * Store a new active session
+ */
+export async function createSession(token: string, userId: string, expiresAt: string): Promise<boolean> {
+  try {
+    await dbQuery(
+      `INSERT INTO sipa_sessions (token, user_id, expires_at)
+       VALUES ($1, $2, $3)`,
+      [token, userId, expiresAt]
+    );
+    return true;
+  } catch (err) {
+    console.error('Error in createSession:', err);
+    return false;
+  }
+}
+
+/**
+ * Retrieve an active session
+ */
+export async function getSession(token: string): Promise<DBSession | null> {
+  try {
+    const res = await dbQuery(
+      `SELECT token, user_id, expires_at 
+       FROM sipa_sessions 
+       WHERE token = $1`,
+      [token]
+    );
+    if (res.rows.length === 0) return null;
+    return res.rows[0];
+  } catch (err) {
+    console.error('Error in getSession:', err);
+    return null;
+  }
+}
+
+/**
+ * Remove/delete a session on logout
+ */
+export async function deleteSession(token: string): Promise<boolean> {
+  try {
+    await dbQuery(
+      `DELETE FROM sipa_sessions 
+       WHERE token = $1`,
+      [token]
+    );
+    return true;
+  } catch (err) {
+    console.error('Error in deleteSession:', err);
+    return false;
+  }
+}
+
