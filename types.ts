@@ -40,6 +40,14 @@ export interface RoundResult {
   reason: string;
 }
 
+export interface ActiveVote {
+  initiatorId: string;
+  initiatorName: string;
+  action: 'cancel' | 'end' | 'pause' | 'resume';
+  votes: Record<string, boolean>; // playerId -> yes/no
+  expiresAt: number;
+}
+
 export interface GameState {
   roomId: string | null;
   players: Player[];
@@ -50,11 +58,12 @@ export interface GameState {
   currentTrickCards: TrickPlayedCard[];
   activePlayerIndex: number;
   tricksHistory: TrickResult[];
-  status: 'lobby' | 'playing' | 'round_end' | 'game_over';
+  status: 'lobby' | 'playing' | 'round_end' | 'game_over' | 'paused' | 'canceled'; // Add paused & canceled statuses
   winnerId: string | null;
   lastRoundResult: RoundResult | null;
   dealerId: string;
   gameMode: 'ai' | 'pass_and_play' | 'online';
+  activeVote?: ActiveVote | null;
 }
 
 export interface ChatMessage {

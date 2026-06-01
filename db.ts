@@ -336,15 +336,34 @@ export async function endMatch(matchId: string, winnerId: string | null): Promis
 }
 
 /**
+ * Cancel a match and set its status to 'canceled' in the database
+ */
+export async function cancelMatch(matchId: string): Promise<boolean> {
+  try {
+    await dbQuery(
+      `UPDATE sipa_matches 
+       SET status = 'canceled', ended_at = CURRENT_TIMESTAMP 
+       WHERE id = $1`,
+      [matchId]
+    );
+    return true;
+  } catch (err) {
+    console.error('Error in cancelMatch:', err);
+    return false;
+  }
+}
+
+/**
  * Retrieve comprehensive playing statistics for a user
  */
 export async function getUserStats(playerId: string) {
   try {
     // Total matches played
     const totalRes = await dbQuery(
-      `SELECT COUNT(DISTINCT match_id) as count 
-       FROM sipa_match_players 
-       WHERE player_id = $1`,
+      `SELECT COUNT(DISTINCT mp.match_id) as count 
+       FROM sipa_match_players mp
+       JOIN sipa_matches m ON mp.match_id = m.id
+       WHERE mp.player_id = $1 AND m.status = 'completed'`,
       [playerId]
     );
     const totalMatches = parseInt(totalRes.rows[0]?.count || '0', 10);
@@ -388,7 +407,7 @@ export async function getUserMatches(playerId: string) {
       `SELECT m.id, m.room_id, m.game_mode, m.status, m.winner_id, m.created_at, m.ended_at
        FROM sipa_matches m
        JOIN sipa_match_players mp ON m.id = mp.match_id
-       WHERE mp.player_id = $1
+       WHERE mp.player_id = $1 AND m.status = 'completed'
        ORDER BY m.created_at DESC
        LIMIT 10`,
       [playerId]
@@ -508,6 +527,41 @@ export async function createUser(id: string, username: string, passwordHash: str
     return { id, username: normalizedUsername, avatar_id: normalizedAvatarId };
   } catch (err) {
     console.error('Error in createUser:', err);
+    throw err;
+  }
+}
+
+/**
+ * Update user details: username, avatar, and optionally password
+ */
+export async function updateUser(
+  id: string,
+  username: string,
+  avatarId: string,
+  passwordHash?: string
+): Promise<DBUser> {
+  const normalizedUsername = username.trim();
+  const normalizedAvatarId = avatarId || 'av1';
+
+  try {
+    if (passwordHash) {
+      await dbQuery(
+        `UPDATE sipa_users 
+         SET username = $1, avatar_id = $2, password_hash = $3 
+         WHERE id = $4`,
+        [normalizedUsername, normalizedAvatarId, passwordHash, id]
+      );
+    } else {
+      await dbQuery(
+        `UPDATE sipa_users 
+         SET username = $1, avatar_id = $2 
+         WHERE id = $3`,
+        [normalizedUsername, normalizedAvatarId, id]
+      );
+    }
+    return { id, username: normalizedUsername, avatar_id: normalizedAvatarId };
+  } catch (err) {
+    console.error('Error in updateUser:', err);
     throw err;
   }
 }

@@ -14,11 +14,11 @@ import {
   getUserMatches,
   getUserByUsername,
   createUser,
-  createSession,
-  getSession,
-  deleteSession,
-  getUserById
+  getUserById,
+  updateUser,
+  cancelMatch
 } from './db.js';
+import { sign, verify } from './jwt.js';
 
 interface Room {
   roomId: string;
@@ -32,6 +32,7 @@ interface Room {
 const app = express();
 const server = http.createServer(app);
 const PORT = Number(process.env.PORT || 3000);
+const JWT_SECRET = process.env.JWT_SECRET || 'sipa_secret_key_2026_safe!';
 
 // Enable CORS so the separate Vercel frontend can call this backend in production
 app.use((req, res, next) => {
@@ -52,7 +53,7 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
   }
 
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -189,10 +190,8 @@ app.post('/api/auth/register', rateLimiter(5, 15 * 60 * 1000), async (req, res) 
 
     const newUser = await createUser(playerId, trimmedUsername, passwordHash, avatar);
 
-    // Créer la session (expire dans 7 jours)
-    const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-    await createSession(token, playerId, expiresAt);
+    // Créer la session JWT (expire dans 7 jours)
+    const token = sign({ userId: playerId, username: trimmedUsername }, JWT_SECRET, { expiresIn: '7d' });
 
     res.json({
       token,
@@ -232,10 +231,8 @@ app.post('/api/auth/login', rateLimiter(15, 5 * 60 * 1000), async (req, res) => 
       return res.status(401).json({ error: "Pseudo ou mot de passe incorrect." });
     }
 
-    // Créer la session (expire dans 7 jours)
-    const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-    await createSession(token, user.id, expiresAt);
+    // Créer la session JWT (expire dans 7 jours)
+    const token = sign({ userId: user.id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
 
     res.json({
       token,
@@ -260,20 +257,15 @@ app.get('/api/auth/me', async (req, res) => {
     }
 
     const token = authHeader.split(' ')[1];
-    const session = await getSession(token);
-    if (!session) {
+    let decoded: any;
+    try {
+      decoded = verify(token, JWT_SECRET);
+    } catch (jwtErr) {
       return res.status(401).json({ error: "Session invalide ou expirée." });
     }
 
-    // Vérifier l'expiration
-    const expiresDate = new Date(session.expires_at);
-    if (expiresDate.getTime() < Date.now()) {
-      await deleteSession(token);
-      return res.status(401).json({ error: "Session expirée." });
-    }
-
     // Récupérer l'utilisateur
-    const user = await getUserById(session.user_id);
+    const user = await getUserById(decoded.userId);
     if (!user) {
       return res.status(401).json({ error: "Utilisateur introuvable." });
     }
@@ -291,18 +283,90 @@ app.get('/api/auth/me', async (req, res) => {
   }
 });
 
-// Déconnexion de l'utilisateur
+// Déconnexion de l'utilisateur (stateless JWT)
 app.post('/api/auth/logout', async (req, res) => {
+  res.json({ success: true });
+});
+
+// Mise à jour des informations de l'utilisateur connecté (pseudo, avatar, mot de passe)
+app.put('/api/users/update', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.split(' ')[1];
-      await deleteSession(token);
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: "Jeton de session absent." });
     }
-    res.json({ success: true });
+
+    const token = authHeader.split(' ')[1];
+    let decoded: any;
+    try {
+      decoded = verify(token, JWT_SECRET);
+    } catch (jwtErr) {
+      return res.status(401).json({ error: "Session invalide ou expirée." });
+    }
+
+    const userId = decoded.userId;
+    const user = await getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ error: "Utilisateur introuvable." });
+    }
+
+    const { username, avatarId, currentPassword, newPassword } = req.body;
+
+    const trimmedUsername = (username || '').trim();
+    if (!trimmedUsername) {
+      return res.status(400).json({ error: "Le pseudo ne peut pas être vide." });
+    }
+
+    // Si le pseudo change, vérifier s'il est déjà pris
+    if (trimmedUsername.toLowerCase() !== user.username.toLowerCase()) {
+      const existingUser = await getUserByUsername(trimmedUsername);
+      if (existingUser && existingUser.id !== userId) {
+        return res.status(400).json({ error: "Ce pseudo est déjà utilisé." });
+      }
+    }
+
+    let passwordHashToSave: string | undefined = undefined;
+
+    // Si un nouveau mot de passe est fourni
+    if (newPassword) {
+      if (!currentPassword) {
+        return res.status(400).json({ error: "Le mot de passe actuel est requis pour changer de mot de passe." });
+      }
+
+      if (!user.password_hash) {
+        return res.status(500).json({ error: "Erreur de configuration du compte." });
+      }
+
+      const isCurrentPasswordValid = verifyPassword(currentPassword, user.password_hash);
+      if (!isCurrentPasswordValid) {
+        return res.status(400).json({ error: "Le mot de passe actuel est incorrect." });
+      }
+
+      if (newPassword.length < 6) {
+        return res.status(400).json({ error: "Le nouveau mot de passe doit faire au moins 6 caractères." });
+      }
+
+      passwordHashToSave = hashPassword(newPassword);
+    }
+
+    // Effectuer la mise à jour
+    const updatedUser = await updateUser(userId, trimmedUsername, avatarId, passwordHashToSave);
+
+    // Signer un nouveau jeton avec le pseudo mis à jour
+    const newToken = sign({ userId, username: trimmedUsername }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.json({
+      message: "Profil mis à jour avec succès !",
+      user: {
+        id: updatedUser.id,
+        username: updatedUser.username,
+        avatarId: updatedUser.avatar_id
+      },
+      token: newToken
+    });
   } catch (err) {
-    console.error('Erreur dans /api/auth/logout :', err);
-    res.status(500).json({ error: "Erreur lors de la déconnexion." });
+    console.error('Erreur dans /api/users/update :', err);
+    res.status(500).json({ error: "Erreur lors de la mise à jour du profil." });
   }
 });
 
@@ -390,6 +454,100 @@ app.post('/api/matches/end-local', async (req, res) => {
     res.status(500).json({ error: 'Erreur interne' });
   }
 });
+
+// Sauvegarde d'un match local annulé en base de données pour traçabilité
+app.post('/api/matches/cancel-local', async (req, res) => {
+  try {
+    const { roomId, gameMode, players } = req.body;
+    if (!players || !Array.isArray(players)) {
+      return res.status(400).json({ error: "players est requis et doit être un tableau" });
+    }
+
+    const sanitizedRoomId = String(roomId || 'local').trim().substring(0, 50).replace(/[^a-zA-Z0-9_\-]/g, '');
+    const sanitizedGameMode = String(gameMode || 'ai').trim().substring(0, 20).replace(/[^a-zA-Z0-9_\-]/g, '');
+
+    const sanitizedPlayers = players.map((p: any) => {
+      return {
+        id: String(p.id || '').trim().substring(0, 50).replace(/[^a-zA-Z0-9_\-]/g, ''),
+        name: String(p.name || '').trim().substring(0, 16).replace(/[<>]/g, ''),
+        isHost: !!p.isHost,
+        isAI: !!p.isAI,
+        avatarId: String(p.avatarId || 'av1').trim().substring(0, 10).replace(/[^a-zA-Z0-9_\-]/g, ''),
+        score: typeof p.score === 'number' ? p.score : 0
+      };
+    });
+
+    const matchId = await createMatch(sanitizedRoomId, sanitizedGameMode, sanitizedPlayers);
+    const scoresMap: { [id: string]: number } = {};
+    sanitizedPlayers.forEach((p) => {
+      scoresMap[p.id] = p.score;
+    });
+    await updateMatchScores(matchId, scoresMap);
+    await cancelMatch(matchId);
+    res.json({ success: true, matchId });
+  } catch (err) {
+    console.error('Erreur dans /api/matches/cancel-local :', err);
+    res.status(500).json({ error: 'Erreur interne' });
+  }
+});
+
+// Resolve a vote: check majority and execute the action
+async function resolveVote(room: Room) {
+  const vote = room.gameState.activeVote;
+  if (!vote) return;
+
+  const totalPlayers = room.gameState.players.length;
+  const yesVotes = Object.values(vote.votes).filter(v => v === true).length;
+  const noVotes = Object.values(vote.votes).filter(v => v === false).length;
+  const majority = Math.ceil(totalPlayers / 2);
+
+  // Check if majority is reached
+  const approved = yesVotes >= majority;
+
+  if (approved) {
+    const action = vote.action;
+
+    if (action === 'cancel') {
+      // Save match as canceled in DB for traceability
+      if (room.matchId) {
+        const scoresMap: { [id: string]: number } = {};
+        room.gameState.players.forEach(p => { scoresMap[p.id] = p.score; });
+        await updateMatchScores(room.matchId, scoresMap).catch(err => console.error('Erreur mise à jour scores avant annulation:', err));
+        await cancelMatch(room.matchId).catch(err => console.error('Erreur annulation match en DB:', err));
+      }
+      room.gameState.status = 'canceled';
+      room.gameState.activeVote = null;
+    } else if (action === 'end') {
+      // End match with highest scorer as winner
+      let highestScorePlayer = room.gameState.players[0];
+      room.gameState.players.forEach(p => {
+        if (p.score > highestScorePlayer.score) {
+          highestScorePlayer = p;
+        }
+      });
+      const winnerId = highestScorePlayer && highestScorePlayer.score > 0 ? highestScorePlayer.id : null;
+      
+      if (room.matchId) {
+        const scoresMap: { [id: string]: number } = {};
+        room.gameState.players.forEach(p => { scoresMap[p.id] = p.score; });
+        await updateMatchScores(room.matchId, scoresMap).catch(err => console.error('Erreur mise à jour scores avant fin:', err));
+        await endMatch(room.matchId, winnerId).catch(err => console.error('Erreur fin match en DB:', err));
+      }
+      room.gameState.status = 'game_over';
+      room.gameState.winnerId = winnerId;
+      room.gameState.activeVote = null;
+    } else if (action === 'pause') {
+      room.gameState.status = 'paused';
+      room.gameState.activeVote = null;
+    } else if (action === 'resume') {
+      room.gameState.status = 'playing';
+      room.gameState.activeVote = null;
+    }
+  } else {
+    // Vote rejected - clear the active vote
+    room.gameState.activeVote = null;
+  }
+}
 
 // Broadcast public state to all connected clients in a specific room
 function broadcastRoomState(room: Room) {
@@ -778,6 +936,77 @@ wss.on('connection', (ws) => {
           }
         });
       }
+
+      // ─── VOTE SYSTEM ─────────────────────────────────────────────
+      if (data.type === 'initiate_vote') {
+        const roomId = clientRoomIds.get(ws);
+        const playerId = clientPlayerIds.get(ws);
+        if (!roomId || !playerId) return;
+
+        const room = rooms.get(roomId);
+        if (!room) return;
+
+        // Prevent duplicate votes
+        if (room.gameState.activeVote) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'Un vote est déjà en cours.' }
+          }));
+          return;
+        }
+
+        const action = data.payload?.action;
+        if (!['cancel', 'end', 'pause', 'resume'].includes(action)) return;
+
+        // Can only resume when paused
+        if (action === 'resume' && room.gameState.status !== 'paused') return;
+        // Can only pause/cancel/end when playing or in round_end
+        if (action !== 'resume' && room.gameState.status !== 'playing' && room.gameState.status !== 'round_end') return;
+
+        const player = room.gameState.players.find(p => p.id === playerId);
+        if (!player) return;
+
+        const votes: Record<string, boolean> = {};
+        votes[playerId] = true; // Initiator votes yes
+
+        room.gameState.activeVote = {
+          initiatorId: playerId,
+          initiatorName: player.name,
+          action,
+          votes,
+          expiresAt: Date.now() + 60000, // 60 second timeout
+        };
+
+        // If only one player, resolve immediately
+        if (room.gameState.players.length <= 1) {
+          await resolveVote(room);
+        }
+
+        broadcastRoomState(room);
+      }
+
+      if (data.type === 'cast_vote') {
+        const roomId = clientRoomIds.get(ws);
+        const playerId = clientPlayerIds.get(ws);
+        if (!roomId || !playerId) return;
+
+        const room = rooms.get(roomId);
+        if (!room || !room.gameState.activeVote) return;
+
+        const vote = !!data.payload?.vote;
+        room.gameState.activeVote.votes[playerId] = vote;
+
+        // Check if all players have voted
+        const totalPlayers = room.gameState.players.length;
+        const totalVotes = Object.keys(room.gameState.activeVote.votes).length;
+
+        if (totalVotes >= totalPlayers) {
+          await resolveVote(room);
+        }
+
+        broadcastRoomState(room);
+      }
+      // ─── END VOTE SYSTEM ──────────────────────────────────────────
 
     } catch (err) {
       console.error('Error handling WebSocket message:', err);
