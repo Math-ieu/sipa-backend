@@ -818,15 +818,6 @@ wss.on('connection', (ws) => {
                 });
                 await updateMatchScores(room.matchId, scoresMap).catch(err => console.error('Erreur lors de la mise à jour des scores en DB :', err));
               }
-
-              const matchWinner = players.find(p => p.score >= 11);
-              if (matchWinner) {
-                room.gameState.status = 'game_over';
-                room.gameState.winnerId = matchWinner.id;
-                if (room.matchId) {
-                  await endMatch(room.matchId, matchWinner.id).catch(err => console.error('Erreur lors de la clôture du match en DB :', err));
-                }
-              }
             } else {
               const nextLeaderIdx = players.findIndex(p => p.id === trickWinnerId);
               room.gameState.currentTrickCards = [];
