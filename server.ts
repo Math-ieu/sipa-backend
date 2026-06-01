@@ -777,61 +777,66 @@ wss.on('connection', (ws) => {
         const totalPlayers = players.length;
         if (currentTrickCards.length < totalPlayers) {
           room.gameState.activePlayerIndex = (room.gameState.activePlayerIndex + 1) % totalPlayers;
+          broadcastRoomState(room);
         } else {
           const leadPlay = currentTrickCards[0];
           const startingSuit = leadPlay.card.suit;
 
-          const trickWinnerId = determineTrickWinner(currentTrickCards, startingSuit);
-          const winningPlayIdx = currentTrickCards.findIndex(p => p.playerId === trickWinnerId);
-          const winningCard = currentTrickCards[winningPlayIdx].card;
+          // Broadcast the state so the last card is visible on the board for everyone!
+          broadcastRoomState(room);
 
-          const newTrickResult = {
-            trickIndex: currentTrickIndex,
-            leadPlayerId: room.gameState.currentLeaderId,
-            winnerId: trickWinnerId,
-            winningCard,
-            playedCards: [...currentTrickCards]
-          };
+          setTimeout(async () => {
+            const trickWinnerId = determineTrickWinner(currentTrickCards, startingSuit);
+            const winningPlayIdx = currentTrickCards.findIndex(p => p.playerId === trickWinnerId);
+            const winningCard = currentTrickCards[winningPlayIdx].card;
 
-          room.gameState.tricksHistory.push(newTrickResult);
+            const newTrickResult = {
+              trickIndex: currentTrickIndex,
+              leadPlayerId: room.gameState.currentLeaderId,
+              winnerId: trickWinnerId,
+              winningCard,
+              playedCards: [...currentTrickCards]
+            };
 
-          if (currentTrickIndex >= 4) {
-            const roundResult = calculateRoundResult(room.gameState.tricksHistory, room.gameState.currentRound || 1);
+            room.gameState.tricksHistory.push(newTrickResult);
 
-            const winnerIdx = players.findIndex(p => p.id === roundResult.winnerId);
-            if (winnerIdx !== -1) {
-              players[winnerIdx].score += roundResult.pointsGained;
-            }
+            if (currentTrickIndex >= 4) {
+              const roundResult = calculateRoundResult(room.gameState.tricksHistory, room.gameState.currentRound || 1);
 
-            room.gameState.status = 'round_end';
-            room.gameState.lastRoundResult = roundResult;
-
-            if (room.matchId) {
-              const scoresMap: { [id: string]: number } = {};
-              players.forEach(p => {
-                scoresMap[p.id] = p.score;
-              });
-              await updateMatchScores(room.matchId, scoresMap).catch(err => console.error('Erreur lors de la mise à jour des scores en DB :', err));
-            }
-
-            const matchWinner = players.find(p => p.score >= 11);
-            if (matchWinner) {
-              room.gameState.status = 'game_over';
-              room.gameState.winnerId = matchWinner.id;
-              if (room.matchId) {
-                await endMatch(room.matchId, matchWinner.id).catch(err => console.error('Erreur lors de la clôture du match en DB :', err));
+              const winnerIdx = players.findIndex(p => p.id === roundResult.winnerId);
+              if (winnerIdx !== -1) {
+                players[winnerIdx].score += roundResult.pointsGained;
               }
-            }
-          } else {
-            const nextLeaderIdx = players.findIndex(p => p.id === trickWinnerId);
-            room.gameState.currentTrickCards = [];
-            room.gameState.currentTrickIndex = currentTrickIndex + 1;
-            room.gameState.currentLeaderId = trickWinnerId;
-            room.gameState.activePlayerIndex = nextLeaderIdx >= 0 ? nextLeaderIdx : 0;
-          }
-        }
 
-        broadcastRoomState(room);
+              room.gameState.status = 'round_end';
+              room.gameState.lastRoundResult = roundResult;
+
+              if (room.matchId) {
+                const scoresMap: { [id: string]: number } = {};
+                players.forEach(p => {
+                  scoresMap[p.id] = p.score;
+                });
+                await updateMatchScores(room.matchId, scoresMap).catch(err => console.error('Erreur lors de la mise à jour des scores en DB :', err));
+              }
+
+              const matchWinner = players.find(p => p.score >= 11);
+              if (matchWinner) {
+                room.gameState.status = 'game_over';
+                room.gameState.winnerId = matchWinner.id;
+                if (room.matchId) {
+                  await endMatch(room.matchId, matchWinner.id).catch(err => console.error('Erreur lors de la clôture du match en DB :', err));
+                }
+              }
+            } else {
+              const nextLeaderIdx = players.findIndex(p => p.id === trickWinnerId);
+              room.gameState.currentTrickCards = [];
+              room.gameState.currentTrickIndex = currentTrickIndex + 1;
+              room.gameState.currentLeaderId = trickWinnerId;
+              room.gameState.activePlayerIndex = nextLeaderIdx >= 0 ? nextLeaderIdx : 0;
+            }
+            broadcastRoomState(room);
+          }, 1400);
+        }
       }
 
       if (data.type === 'deal_next_round') {
