@@ -48,6 +48,11 @@ export interface ActiveVote {
   expiresAt: number;
 }
 
+export interface RoundHistoryEntry {
+  roundNumber: number;
+  tricks: TrickResult[];
+}
+
 export interface GameState {
   roomId: string | null;
   players: Player[];
@@ -64,6 +69,7 @@ export interface GameState {
   dealerId: string;
   gameMode: 'ai' | 'pass_and_play' | 'online';
   activeVote?: ActiveVote | null;
+  roundsHistory?: RoundHistoryEntry[];
 }
 
 export interface ChatMessage {

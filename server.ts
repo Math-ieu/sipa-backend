@@ -89,7 +89,8 @@ app.post('/api/create-room', (req, res) => {
     winnerId: null,
     dealerId: '',
     status: 'lobby',
-    gameMode: 'online'
+    gameMode: 'online',
+    roundsHistory: []
   };
 
   rooms.set(roomId, {
@@ -420,7 +421,7 @@ app.get('/api/users/:playerId/matches', async (req, res) => {
 // Sauvegarde des résultats d'un match local (contre l'IA)
 app.post('/api/matches/end-local', async (req, res) => {
   try {
-    const { roomId, gameMode, players, winnerId } = req.body;
+    const { roomId, gameMode, players, winnerId, roundsHistory } = req.body;
     if (!players || !Array.isArray(players)) {
       return res.status(400).json({ error: "players est requis et doit être un tableau" });
     }
@@ -447,7 +448,9 @@ app.post('/api/matches/end-local', async (req, res) => {
       scoresMap[p.id] = p.score;
     });
     await updateMatchScores(matchId, scoresMap);
-    await endMatch(matchId, sanitizedWinnerId);
+
+    const historyJson = (roundsHistory && Array.isArray(roundsHistory)) ? JSON.stringify(roundsHistory) : null;
+    await endMatch(matchId, sanitizedWinnerId, historyJson);
     res.json({ success: true, matchId });
   } catch (err) {
     console.error('Erreur dans /api/matches/end-local :', err);
@@ -458,7 +461,7 @@ app.post('/api/matches/end-local', async (req, res) => {
 // Sauvegarde d'un match local annulé en base de données pour traçabilité
 app.post('/api/matches/cancel-local', async (req, res) => {
   try {
-    const { roomId, gameMode, players } = req.body;
+    const { roomId, gameMode, players, roundsHistory } = req.body;
     if (!players || !Array.isArray(players)) {
       return res.status(400).json({ error: "players est requis et doit être un tableau" });
     }
@@ -483,7 +486,9 @@ app.post('/api/matches/cancel-local', async (req, res) => {
       scoresMap[p.id] = p.score;
     });
     await updateMatchScores(matchId, scoresMap);
-    await cancelMatch(matchId);
+
+    const historyJson = (roundsHistory && Array.isArray(roundsHistory)) ? JSON.stringify(roundsHistory) : null;
+    await cancelMatch(matchId, historyJson);
     res.json({ success: true, matchId });
   } catch (err) {
     console.error('Erreur dans /api/matches/cancel-local :', err);
@@ -513,7 +518,8 @@ async function resolveVote(room: Room) {
         const scoresMap: { [id: string]: number } = {};
         room.gameState.players.forEach(p => { scoresMap[p.id] = p.score; });
         await updateMatchScores(room.matchId, scoresMap).catch(err => console.error('Erreur mise à jour scores avant annulation:', err));
-        await cancelMatch(room.matchId).catch(err => console.error('Erreur annulation match en DB:', err));
+        const historyJson = room.gameState.roundsHistory ? JSON.stringify(room.gameState.roundsHistory) : null;
+        await cancelMatch(room.matchId, historyJson).catch(err => console.error('Erreur annulation match en DB:', err));
       }
       room.gameState.status = 'canceled';
       room.gameState.activeVote = null;
@@ -531,7 +537,8 @@ async function resolveVote(room: Room) {
         const scoresMap: { [id: string]: number } = {};
         room.gameState.players.forEach(p => { scoresMap[p.id] = p.score; });
         await updateMatchScores(room.matchId, scoresMap).catch(err => console.error('Erreur mise à jour scores avant fin:', err));
-        await endMatch(room.matchId, winnerId).catch(err => console.error('Erreur fin match en DB:', err));
+        const historyJson = room.gameState.roundsHistory ? JSON.stringify(room.gameState.roundsHistory) : null;
+        await endMatch(room.matchId, winnerId, historyJson).catch(err => console.error('Erreur fin match en DB:', err));
       }
       room.gameState.status = 'game_over';
       room.gameState.winnerId = winnerId;
@@ -740,6 +747,7 @@ wss.on('connection', (ws) => {
         room.gameState.activePlayerIndex = players.findIndex(p => p.id === startingLeaderId);
         room.gameState.currentTrickCards = [];
         room.gameState.tricksHistory = [];
+        room.gameState.roundsHistory = [];
         room.gameState.winnerId = null;
         room.gameState.lastRoundResult = null;
 
@@ -811,6 +819,14 @@ wss.on('connection', (ws) => {
               room.gameState.status = 'round_end';
               room.gameState.lastRoundResult = roundResult;
 
+              if (!room.gameState.roundsHistory) {
+                room.gameState.roundsHistory = [];
+              }
+              room.gameState.roundsHistory.push({
+                roundNumber: room.gameState.currentRound || 1,
+                tricks: [...room.gameState.tricksHistory]
+              });
+
               if (room.matchId) {
                 const scoresMap: { [id: string]: number } = {};
                 players.forEach(p => {
@@ -879,7 +895,8 @@ wss.on('connection', (ws) => {
             }
           });
           if (highestScorePlayer && highestScorePlayer.score > 0) {
-            await endMatch(room.matchId, highestScorePlayer.id).catch(err => console.error('Erreur de clôture sur reset :', err));
+            const historyJson = room.gameState.roundsHistory ? JSON.stringify(room.gameState.roundsHistory) : null;
+            await endMatch(room.matchId, highestScorePlayer.id, historyJson).catch(err => console.error('Erreur de clôture sur reset :', err));
           }
           room.matchId = undefined;
         }
@@ -887,6 +904,7 @@ wss.on('connection', (ws) => {
         room.gameState.players.forEach(p => {
           p.score = 0;
         });
+        room.gameState.roundsHistory = [];
 
         broadcastRoomState(room);
       }
@@ -1028,7 +1046,8 @@ wss.on('connection', (ws) => {
               }
             });
             if (highestScorePlayer && highestScorePlayer.score > 0) {
-              endMatch(room.matchId, highestScorePlayer.id).catch(err => console.error('Erreur de clôture sur déconnexion générale :', err));
+              const historyJson = room.gameState.roundsHistory ? JSON.stringify(room.gameState.roundsHistory) : null;
+              endMatch(room.matchId, highestScorePlayer.id, historyJson).catch(err => console.error('Erreur de clôture sur déconnexion générale :', err));
             }
           }
           rooms.delete(roomId);

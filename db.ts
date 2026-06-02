@@ -139,6 +139,11 @@ export async function initDB(): Promise<boolean> {
         );
       `);
 
+      // Migration: Add history_json if not existing
+      await pool.query(`
+        ALTER TABLE sipa_matches ADD COLUMN IF NOT EXISTS history_json TEXT;
+      `);
+
       await pool.query(`
         CREATE TABLE IF NOT EXISTS sipa_match_players (
           match_id VARCHAR(50) REFERENCES sipa_matches(id) ON DELETE CASCADE,
@@ -211,6 +216,14 @@ export async function initDB(): Promise<boolean> {
           ended_at TEXT
         );
       `);
+
+      // Migration: check if history_json exists, if not add it
+      const tableInfoMatches = await executeSql("PRAGMA table_info(sipa_matches)");
+      const hasHistoryJson = tableInfoMatches.rows.some((row: any) => row.name === 'history_json');
+      if (!hasHistoryJson) {
+        console.log('Adding history_json column to sipa_matches in SQLite...');
+        await executeSql("ALTER TABLE sipa_matches ADD COLUMN history_json TEXT");
+      }
 
       await executeSql(`
         CREATE TABLE IF NOT EXISTS sipa_match_players (
@@ -320,13 +333,13 @@ export async function updateMatchScores(
 /**
  * Finalize a match with a declared winner
  */
-export async function endMatch(matchId: string, winnerId: string | null): Promise<boolean> {
+export async function endMatch(matchId: string, winnerId: string | null, historyJson?: string | null): Promise<boolean> {
   try {
     await dbQuery(
       `UPDATE sipa_matches 
-       SET status = 'completed', winner_id = $1, ended_at = CURRENT_TIMESTAMP 
-       WHERE id = $2`,
-      [winnerId, matchId]
+       SET status = 'completed', winner_id = $1, ended_at = CURRENT_TIMESTAMP, history_json = $2
+       WHERE id = $3`,
+      [winnerId, historyJson || null, matchId]
     );
     return true;
   } catch (err) {
@@ -338,13 +351,13 @@ export async function endMatch(matchId: string, winnerId: string | null): Promis
 /**
  * Cancel a match and set its status to 'canceled' in the database
  */
-export async function cancelMatch(matchId: string): Promise<boolean> {
+export async function cancelMatch(matchId: string, historyJson?: string | null): Promise<boolean> {
   try {
     await dbQuery(
       `UPDATE sipa_matches 
-       SET status = 'canceled', ended_at = CURRENT_TIMESTAMP 
+       SET status = 'canceled', ended_at = CURRENT_TIMESTAMP, history_json = $2 
        WHERE id = $1`,
-      [matchId]
+      [matchId, historyJson || null]
     );
     return true;
   } catch (err) {
@@ -404,7 +417,7 @@ export async function getUserMatches(playerId: string) {
   try {
     // 1. Fetch matches the user participated in
     const matchesRes = await dbQuery(
-      `SELECT m.id, m.room_id, m.game_mode, m.status, m.winner_id, m.created_at, m.ended_at
+      `SELECT m.id, m.room_id, m.game_mode, m.status, m.winner_id, m.created_at, m.ended_at, m.history_json
        FROM sipa_matches m
        JOIN sipa_match_players mp ON m.id = mp.match_id
        WHERE mp.player_id = $1 AND m.status = 'completed'
@@ -443,6 +456,7 @@ export async function getUserMatches(playerId: string) {
         createdAt: row.created_at,
         endedAt: row.ended_at,
         players,
+        history: row.history_json ? JSON.parse(row.history_json) : null,
       });
     }
 
