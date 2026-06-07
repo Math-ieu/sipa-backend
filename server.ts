@@ -104,6 +104,21 @@ app.post('/api/create-room', (req, res) => {
   res.json({ roomId });
 });
 
+// Vérifier si un salon existe et retourner son statut (pour reconnexion et lien d'invitation)
+app.get('/api/rooms/:roomId', (req, res) => {
+  const { roomId } = req.params;
+  const sanitizedRoomId = String(roomId || '').trim().substring(0, 10).replace(/[^a-zA-Z0-9_\-]/g, '');
+  const room = rooms.get(sanitizedRoomId);
+  if (!room) {
+    return res.status(404).json({ error: 'Salon introuvable.' });
+  }
+  res.json({
+    roomId: room.roomId,
+    status: room.gameState.status,
+    playerCount: room.gameState.players.length,
+  });
+});
+
 // -------------------------------------------------------------
 // Authentication and Registration Endpoints (with Rate Limiting & Input Sanitization)
 // -------------------------------------------------------------
